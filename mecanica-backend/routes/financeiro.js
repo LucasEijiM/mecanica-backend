@@ -1,6 +1,10 @@
 const express = require('express');
 const crypto = require('crypto');
 const { carregarFinanceiro, salvarFinanceiro, carregarUsuarios } = require('../db');
+
+// 🔥 FIREBASE
+const { db, admin } = require('../firebase-db');
+
 const {
   validarFinanceiro,
   validarAtualizacaoFinanceiro,
@@ -9,7 +13,6 @@ const {
 const router = express.Router();
 
 // GET /api/financeiro
-// Lista lançamentos financeiros. Aceita ?clienteId=..., ?ordemServicoId=... e/ou ?status=...
 router.get('/financeiro', (req, res) => {
   const { clienteId, ordemServicoId, status } = req.query;
   let lancamentos = carregarFinanceiro();
@@ -38,18 +41,15 @@ router.get('/financeiro/:id', (req, res) => {
   return res.json({ sucesso: true, financeiro: lancamento });
 });
 
-// POST /api/financeiro
-// Body esperado: { ordemServicoId, clienteId, valor, formaPagamento, parcelas?, status? }
+// POST /api/financeiro (JSON DB)
 router.post('/financeiro', (req, res) => {
   const { ordemServicoId, clienteId, valor, formaPagamento, parcelas, status } = req.body;
 
-  // 1. Validar campos
   const erros = validarFinanceiro({ ordemServicoId, clienteId, valor, formaPagamento, parcelas, status });
   if (erros.length > 0) {
     return res.status(400).json({ sucesso: false, erros });
   }
 
-  // 2. Verificar se o cliente existe e é do tipo "cliente"
   const cliente = carregarUsuarios().find((u) => u.uid === clienteId);
   if (!cliente || cliente.tipo !== 'cliente') {
     return res.status(404).json({ sucesso: false, erros: ['Cliente não encontrado.'] });
@@ -59,8 +59,6 @@ router.post('/financeiro', (req, res) => {
   }
 
   const statusFinal = status || 'pendente';
-
-  // 3. Montar o documento financeiro/{id}
   const novoLancamento = {
     id: crypto.randomUUID(),
     ordemServicoId,
@@ -83,9 +81,105 @@ router.post('/financeiro', (req, res) => {
   });
 });
 
+// 🔥 NOVA ROTA - SALVA NO FIREBASE
+router.post('/financeiro-firebase', async (req, res) => {
+  const { ordemServicoId, clienteId, valor, formaPagamento, parcelas, status } = req.body;
+
+  const erros = validarFinanceiro({ ordemServicoId, clienteId, valor, formaPagamento, parcelas, status });
+  if (erros.length > 0) {
+    return res.status(400).json({ sucesso: false, erros });
+  }
+
+  const cliente = carregarUsuarios().find((u) => u.uid === clienteId);
+  if (!cliente || cliente.tipo !== 'cliente') {
+    return res.status(404).json({ sucesso: false, erros: ['Cliente não encontrado.'] });
+  }
+  if (!cliente.ativo) {
+    return res.status(409).json({ sucesso: false, erros: ['Cliente está inativo.'] });
+  }
+
+  const statusFinal = status || 'pendente';
+
+  try {
+    const firebaseData = {
+      ordemServicoId,
+      clienteId,
+      valor: Number(valor),
+      formaPagamento,
+      status: statusFinal,
+      dataPagamento: statusFinal === 'pago' ? new Date().toISOString() : null,
+      parcelas: parcelas !== undefined && parcelas !== null ? Number(parcelas) : 1,
+      criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const docRef = await db.collection('financeiro').add(firebaseData);
+    const firebaseId = docRef.id;
+
+    const novoLancamento = {
+      id: firebaseId,
+      ordemServicoId,
+      clienteId,
+      valor: Number(valor),
+      formaPagamento,
+      status: statusFinal,
+      dataPagamento: statusFinal === 'pago' ? new Date().toISOString() : null,
+      parcelas: parcelas !== undefined && parcelas !== null ? Number(parcelas) : 1,
+      firebaseId,
+    };
+
+    const lancamentos = carregarFinanceiro();
+    lancamentos.push(novoLancamento);
+    salvarFinanceiro(lancamentos);
+
+    return res.status(201).json({
+      sucesso: true,
+      mensagem: 'Lançamento financeiro salvo no Firebase e no JSON!',
+      firebaseId,
+      financeiro: novoLancamento,
+    });
+
+  } catch (error) {
+    console.error('Erro ao salvar lançamento financeiro no Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao salvar no Firebase: ' + error.message]
+    });
+  }
+});
+
+// 🔥 NOVA ROTA - LISTAR FINANCEIRO DO FIREBASE
+router.get('/financeiro-firebase', async (req, res) => {
+  try {
+    const { clienteId, ordemServicoId, status } = req.query;
+    let query = db.collection('financeiro');
+
+    if (clienteId) {
+      query = query.where('clienteId', '==', clienteId);
+    }
+    if (ordemServicoId) {
+      query = query.where('ordemServicoId', '==', ordemServicoId);
+    }
+    if (status) {
+      query = query.where('status', '==', status);
+    }
+
+    const snapshot = await query.get();
+    const lancamentos = [];
+    snapshot.forEach(doc => {
+      lancamentos.push({ id: doc.id, ...doc.data() });
+    });
+
+    return res.json({ sucesso: true, financeiro: lancamentos });
+  } catch (error) {
+    console.error('Erro ao listar financeiro do Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao listar financeiro do Firebase: ' + error.message]
+    });
+  }
+});
+
 // PUT /api/financeiro/:id
-// Atualiza um lançamento financeiro (todos os campos são opcionais)
-// Body esperado: { valor?, formaPagamento?, parcelas?, status? }
 router.put('/financeiro/:id', (req, res) => {
   const { valor, formaPagamento, parcelas, status } = req.body;
 
@@ -104,8 +198,6 @@ router.put('/financeiro/:id', (req, res) => {
   const atual = lancamentos[indice];
   const novoStatus = status !== undefined ? status : atual.status;
 
-  // Se o status mudar para "pago" e ainda não havia dataPagamento, registra agora.
-  // Se mudar para outro status, mantém a dataPagamento anterior (histórico).
   let dataPagamento = atual.dataPagamento;
   if (status !== undefined && status === 'pago' && atual.status !== 'pago') {
     dataPagamento = new Date().toISOString();
@@ -130,7 +222,6 @@ router.put('/financeiro/:id', (req, res) => {
   });
 });
 
-// Altera apenas o status de um lançamento (ex: marcar como pago/cancelado/estornado)
 function alterarStatusFinanceiro(req, res, novoStatus) {
   const lancamentos = carregarFinanceiro();
   const indice = lancamentos.findIndex((f) => f.id === req.params.id);
@@ -153,16 +244,10 @@ function alterarStatusFinanceiro(req, res, novoStatus) {
   });
 }
 
-// PATCH /api/financeiro/:id/pagar
 router.patch('/financeiro/:id/pagar', (req, res) => alterarStatusFinanceiro(req, res, 'pago'));
-
-// PATCH /api/financeiro/:id/cancelar
 router.patch('/financeiro/:id/cancelar', (req, res) => alterarStatusFinanceiro(req, res, 'cancelado'));
-
-// PATCH /api/financeiro/:id/estornar
 router.patch('/financeiro/:id/estornar', (req, res) => alterarStatusFinanceiro(req, res, 'estornado'));
 
-// DELETE /api/financeiro/:id
 router.delete('/financeiro/:id', (req, res) => {
   const lancamentos = carregarFinanceiro();
   const indice = lancamentos.findIndex((f) => f.id === req.params.id);

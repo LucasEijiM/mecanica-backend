@@ -15,10 +15,11 @@ const {
   validarMecanico,
 } = require('../validators/validarCadastro');
 
+// 🔥 FIREBASE
+const { db, admin } = require('../firebase-db');
+
 const router = express.Router();
 
-// Junta o documento usuarios/{uid} com o documento extra (mecanicos/{uid}
-// ou clientes/{uid}) e remove a senha da resposta.
 function montarPerfilCompleto(usuario) {
   const { senha, ...usuarioSemSenha } = usuario;
 
@@ -35,17 +36,12 @@ function montarPerfilCompleto(usuario) {
   return usuarioSemSenha;
 }
 
-// POST /api/cadastro
-// Body esperado (comum): { tipo, nome, email, senha, dataNascimento, telefone, cpf }
-// tipo "cliente"  -> exige também: { endereco, complemento? }
-// tipo "mecanico" -> exige também: { especialidade, comissao, dataContratacao? }
+// ROTA ORIGINAL - JSON DB
 router.post('/cadastro', async (req, res) => {
   const { tipo, nome, email, senha, dataNascimento, telefone, cpf } = req.body;
 
-  // 1. Validar campos comuns (documento usuarios/{uid})
   const erros = validarUsuarioComum({ tipo, nome, email, senha, dataNascimento, telefone, cpf });
 
-  // 2. Validar campos específicos do tipo
   if (tipo === 'cliente') {
     erros.push(...validarCliente(req.body));
   } else if (tipo === 'mecanico') {
@@ -58,7 +54,6 @@ router.post('/cadastro', async (req, res) => {
 
   const usuarios = carregarUsuarios();
 
-  // 3. Verificar duplicidade de email
   const emailExiste = usuarios.some(
     (u) => u.email.toLowerCase() === email.toLowerCase()
   );
@@ -66,22 +61,15 @@ router.post('/cadastro', async (req, res) => {
     return res.status(409).json({ sucesso: false, erros: ['Este email já está cadastrado.'] });
   }
 
-  // 4. Verificar duplicidade de CPF
   const cpfLimpo = cpf.replace(/[^\d]/g, '');
   const cpfExiste = usuarios.some((u) => u.cpf === cpfLimpo);
   if (cpfExiste) {
     return res.status(409).json({ sucesso: false, erros: ['Este CPF já está cadastrado.'] });
   }
 
-  // 5. Criptografar a senha antes de salvar
-  // Observação: o schema de usuarios/{uid} não lista "senha" porque, em um
-  // Firestore real, a autenticação ficaria no Firebase Authentication, fora
-  // do documento. Como este projeto não usa Firebase Auth, mantemos o hash
-  // aqui para permitir login — mas ele nunca é devolvido nas respostas.
   const senhaHash = await bcrypt.hash(senha, 10);
   const uid = crypto.randomUUID();
 
-  // 6. Montar o documento usuarios/{uid}
   const novoUsuario = {
     uid,
     nome: nome.trim(),
@@ -89,7 +77,7 @@ router.post('/cadastro', async (req, res) => {
     cpf: cpfLimpo,
     telefone: telefone.replace(/[^\d]/g, ''),
     dataNascimento,
-    tipo, // "cliente" ou "mecanico"
+    tipo,
     criadoEm: new Date().toISOString(),
     ativo: true,
     senha: senhaHash,
@@ -98,7 +86,6 @@ router.post('/cadastro', async (req, res) => {
   usuarios.push(novoUsuario);
   salvarUsuarios(usuarios);
 
-  // 7. Montar o documento extra (mecanicos/{uid} ou clientes/{uid})
   let dadosExtra;
 
   if (tipo === 'mecanico') {
@@ -130,7 +117,6 @@ router.post('/cadastro', async (req, res) => {
     salvarClientes(clientes);
   }
 
-  // 8. Nunca retornar a senha (nem o hash) na resposta
   const { senha: _senha, ...usuarioSemSenha } = novoUsuario;
 
   return res.status(201).json({
@@ -140,8 +126,113 @@ router.post('/cadastro', async (req, res) => {
   });
 });
 
+// 🔥 NOVA ROTA - SALVA NO FIREBASE
+router.post('/cadastro-firebase', async (req, res) => {
+  const { tipo, nome, email, senha, dataNascimento, telefone, cpf } = req.body;
+
+  const erros = validarUsuarioComum({ tipo, nome, email, senha, dataNascimento, telefone, cpf });
+
+  if (tipo === 'cliente') {
+    erros.push(...validarCliente(req.body));
+  } else if (tipo === 'mecanico') {
+    erros.push(...validarMecanico(req.body));
+  }
+
+  if (erros.length > 0) {
+    return res.status(400).json({ sucesso: false, erros });
+  }
+
+  const usuarios = carregarUsuarios();
+  const emailExiste = usuarios.some(
+    (u) => u.email.toLowerCase() === email.toLowerCase()
+  );
+  if (emailExiste) {
+    return res.status(409).json({ sucesso: false, erros: ['Este email já está cadastrado.'] });
+  }
+
+  const cpfLimpo = cpf.replace(/[^\d]/g, '');
+  const cpfExiste = usuarios.some((u) => u.cpf === cpfLimpo);
+  if (cpfExiste) {
+    return res.status(409).json({ sucesso: false, erros: ['Este CPF já está cadastrado.'] });
+  }
+
+  try {
+    const firebaseData = {
+      nome: nome.trim(),
+      email: email.toLowerCase().trim(),
+      cpf: cpfLimpo,
+      telefone: telefone.replace(/[^\d]/g, ''),
+      dataNascimento,
+      tipo,
+      criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      ativo: true,
+    };
+
+    const docRef = await db.collection('usuarios').add(firebaseData);
+    const firebaseId = docRef.id;
+
+    const senhaHash = await bcrypt.hash(senha, 10);
+    const novoUsuario = {
+      uid: firebaseId,
+      nome: nome.trim(),
+      email: email.toLowerCase().trim(),
+      cpf: cpfLimpo,
+      telefone: telefone.replace(/[^\d]/g, ''),
+      dataNascimento,
+      tipo,
+      criadoEm: new Date().toISOString(),
+      ativo: true,
+      senha: senhaHash,
+      firebaseId,
+    };
+
+    usuarios.push(novoUsuario);
+    salvarUsuarios(usuarios);
+
+    let dadosExtra;
+    if (tipo === 'mecanico') {
+      const { especialidade, comissao, dataContratacao } = req.body;
+      const mecanicos = carregarMecanicos();
+      dadosExtra = {
+        uid: firebaseId,
+        especialidade: especialidade.trim(),
+        comissao: Number(comissao),
+        dataContratacao: dataContratacao ? new Date(dataContratacao).toISOString() : new Date().toISOString(),
+        ativo: true,
+      };
+      mecanicos.push(dadosExtra);
+      salvarMecanicos(mecanicos);
+    } else {
+      const { endereco, complemento } = req.body;
+      const clientes = carregarClientes();
+      dadosExtra = {
+        uid: firebaseId,
+        endereco: endereco.trim(),
+        complemento: complemento ? complemento.trim() : null,
+        ativo: true,
+      };
+      clientes.push(dadosExtra);
+      salvarClientes(clientes);
+    }
+
+    const { senha: _senha, ...usuarioSemSenha } = novoUsuario;
+    return res.status(201).json({
+      sucesso: true,
+      mensagem: 'Cliente salvo no Firebase e no JSON!',
+      firebaseId,
+      usuario: { ...usuarioSemSenha, ...dadosExtra },
+    });
+
+  } catch (error) {
+    console.error('Erro ao salvar no Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao salvar no Firebase: ' + error.message]
+    });
+  }
+});
+
 // GET /api/usuarios
-// Lista usuários (perfil completo, sem senha). Aceita ?tipo=cliente|mecanico e ?ativo=true|false
 router.get('/usuarios', (req, res) => {
   const { tipo, ativo } = req.query;
   let usuarios = carregarUsuarios();
@@ -157,8 +248,25 @@ router.get('/usuarios', (req, res) => {
   return res.json({ sucesso: true, usuarios: perfis });
 });
 
+// 🔥 NOVA ROTA - LISTAR USUÁRIOS DO FIREBASE
+router.get('/usuarios-firebase', async (req, res) => {
+  try {
+    const snapshot = await db.collection('usuarios').get();
+    const usuarios = [];
+    snapshot.forEach(doc => {
+      usuarios.push({ id: doc.id, ...doc.data() });
+    });
+    return res.json({ sucesso: true, usuarios });
+  } catch (error) {
+    console.error('Erro ao listar usuários do Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao listar usuários do Firebase: ' + error.message]
+    });
+  }
+});
+
 // GET /api/usuarios/:uid
-// Retorna o perfil completo (usuarios/{uid} + mecanicos/{uid} ou clientes/{uid})
 router.get('/usuarios/:uid', (req, res) => {
   const usuario = carregarUsuarios().find((u) => u.uid === req.params.uid);
 
@@ -169,7 +277,12 @@ router.get('/usuarios/:uid', (req, res) => {
   return res.json({ sucesso: true, usuario: montarPerfilCompleto(usuario) });
 });
 
-// Ativa/desativa um usuário e o documento extra correspondente (soft delete)
+// PATCH /api/usuarios/:uid/desativar
+router.patch('/usuarios/:uid/desativar', (req, res) => alterarStatusUsuario(req, res, false));
+
+// PATCH /api/usuarios/:uid/ativar
+router.patch('/usuarios/:uid/ativar', (req, res) => alterarStatusUsuario(req, res, true));
+
 function alterarStatusUsuario(req, res, ativo) {
   const usuarios = carregarUsuarios();
   const indice = usuarios.findIndex((u) => u.uid === req.params.uid);
@@ -204,11 +317,5 @@ function alterarStatusUsuario(req, res, ativo) {
     usuario: montarPerfilCompleto(usuario),
   });
 }
-
-// PATCH /api/usuarios/:uid/desativar
-router.patch('/usuarios/:uid/desativar', (req, res) => alterarStatusUsuario(req, res, false));
-
-// PATCH /api/usuarios/:uid/ativar
-router.patch('/usuarios/:uid/ativar', (req, res) => alterarStatusUsuario(req, res, true));
 
 module.exports = router;

@@ -1,6 +1,10 @@
 const express = require('express');
 const crypto = require('crypto');
 const { carregarItensOS, salvarItensOS, carregarPecas, salvarPecas } = require('../db');
+
+// 🔥 FIREBASE
+const { db, admin } = require('../firebase-db');
+
 const { validarItemOS, validarAtualizacaoItemOS } = require('../validators/validarItemOS');
 
 const router = express.Router();
@@ -10,7 +14,6 @@ function arredondar(valor) {
 }
 
 // GET /api/itensOS
-// Lista itens de OS. Aceita ?ordemServicoId=... e/ou ?tipo=peca|servico
 router.get('/itensOS', (req, res) => {
   const { ordemServicoId, tipo } = req.query;
   let itens = carregarItensOS();
@@ -38,12 +41,7 @@ router.get('/itensOS/:id', (req, res) => {
   return res.json({ sucesso: true, itemOS: item });
 });
 
-// POST /api/itensOS
-// Body esperado:
-//  - tipo "peca":    { ordemServicoId, tipo: "peca", itemId, quantidade }
-//                     (nome e precoUnitario são preenchidos a partir da peça,
-//                      e a baixa é feita automaticamente no estoqueAtual)
-//  - tipo "servico": { ordemServicoId, tipo: "servico", nome, quantidade, precoUnitario }
+// POST /api/itensOS (JSON DB)
 router.post('/itensOS', (req, res) => {
   const { ordemServicoId, tipo, itemId, quantidade } = req.body;
   let { nome, precoUnitario } = req.body;
@@ -71,7 +69,6 @@ router.post('/itensOS', (req, res) => {
         erros: [`Quantidade insuficiente em estoque. Disponível: ${peca.estoqueAtual}.`],
       });
     }
-    // Preenche nome/preço a partir do cadastro da peça (garante consistência)
     nome = peca.nome;
     precoUnitario = peca.precoVenda;
   }
@@ -87,7 +84,6 @@ router.post('/itensOS', (req, res) => {
     subtotal: arredondar(Number(quantidade) * Number(precoUnitario)),
   };
 
-  // Baixa automática no estoque quando o item é uma peça
   if (tipo === 'peca') {
     pecas[pecaIndice].estoqueAtual -= Number(quantidade);
     salvarPecas(pecas);
@@ -104,10 +100,127 @@ router.post('/itensOS', (req, res) => {
   });
 });
 
+// 🔥 NOVA ROTA - SALVA NO FIREBASE
+router.post('/itensOS-firebase', async (req, res) => {
+  const { ordemServicoId, tipo, itemId, quantidade } = req.body;
+  let { nome, precoUnitario } = req.body;
+
+  const errosComuns = validarItemOS({ ordemServicoId, tipo, itemId, nome, quantidade, precoUnitario });
+  if (errosComuns.length > 0) {
+    return res.status(400).json({ sucesso: false, erros: errosComuns });
+  }
+
+  const pecas = carregarPecas();
+  let pecaIndice = -1;
+
+  if (tipo === 'peca') {
+    pecaIndice = pecas.findIndex((p) => p.id === itemId);
+    if (pecaIndice === -1) {
+      return res.status(404).json({ sucesso: false, erros: ['Peça não encontrada.'] });
+    }
+    const peca = pecas[pecaIndice];
+    if (!peca.ativo) {
+      return res.status(409).json({ sucesso: false, erros: ['Peça está inativa.'] });
+    }
+    if (Number(quantidade) > peca.estoqueAtual) {
+      return res.status(400).json({
+        sucesso: false,
+        erros: [`Quantidade insuficiente em estoque. Disponível: ${peca.estoqueAtual}.`],
+      });
+    }
+    nome = peca.nome;
+    precoUnitario = peca.precoVenda;
+  }
+
+  const novoItem = {
+    id: crypto.randomUUID(),
+    ordemServicoId,
+    tipo,
+    itemId: tipo === 'peca' ? itemId : (itemId || null),
+    nome: nome.trim(),
+    quantidade: Number(quantidade),
+    precoUnitario: Number(precoUnitario),
+    subtotal: arredondar(Number(quantidade) * Number(precoUnitario)),
+  };
+
+  try {
+    const firebaseData = {
+      ordemServicoId,
+      tipo,
+      itemId: tipo === 'peca' ? itemId : null,
+      nome: nome.trim(),
+      quantidade: Number(quantidade),
+      precoUnitario: Number(precoUnitario),
+      subtotal: novoItem.subtotal,
+      criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const docRef = await db.collection('itensOS').add(firebaseData);
+    const firebaseId = docRef.id;
+
+    const itemComFirebase = {
+      ...novoItem,
+      id: firebaseId,
+      firebaseId,
+    };
+
+    if (tipo === 'peca') {
+      pecas[pecaIndice].estoqueAtual -= Number(quantidade);
+      salvarPecas(pecas);
+    }
+
+    const itens = carregarItensOS();
+    itens.push(itemComFirebase);
+    salvarItensOS(itens);
+
+    return res.status(201).json({
+      sucesso: true,
+      mensagem: 'Item salvo no Firebase e no JSON!',
+      firebaseId,
+      itemOS: itemComFirebase,
+    });
+
+  } catch (error) {
+    console.error('Erro ao salvar item OS no Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao salvar no Firebase: ' + error.message]
+    });
+  }
+});
+
+// 🔥 NOVA ROTA - LISTAR ITENS OS DO FIREBASE
+router.get('/itensOS-firebase', async (req, res) => {
+  try {
+    const { ordemServicoId, tipo } = req.query;
+    let query = db.collection('itensOS');
+
+    if (ordemServicoId) {
+      query = query.where('ordemServicoId', '==', ordemServicoId);
+    }
+    if (tipo) {
+      query = query.where('tipo', '==', tipo);
+    }
+
+    const snapshot = await query.get();
+    const itens = [];
+    snapshot.forEach(doc => {
+      itens.push({ id: doc.id, ...doc.data() });
+    });
+
+    const total = arredondar(itens.reduce((soma, i) => soma + (i.subtotal || 0), 0));
+
+    return res.json({ sucesso: true, itensOS: itens, total });
+  } catch (error) {
+    console.error('Erro ao listar itens OS do Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao listar itens OS do Firebase: ' + error.message]
+    });
+  }
+});
+
 // PUT /api/itensOS/:id
-// Atualiza um item de OS. Body esperado (opcionais): { quantidade?, nome?, precoUnitario? }
-// - nome e precoUnitario só podem ser alterados em itens do tipo "servico"
-// - quantidade: em itens do tipo "peca", ajusta o estoqueAtual pela diferença
 router.put('/itensOS/:id', (req, res) => {
   const { quantidade, nome, precoUnitario } = req.body;
 
@@ -132,7 +245,6 @@ router.put('/itensOS/:id', (req, res) => {
     });
   }
 
-  // Se a quantidade de um item do tipo "peca" mudar, ajusta o estoqueAtual pela diferença
   if (quantidade !== undefined && itemAtual.tipo === 'peca') {
     const pecas = carregarPecas();
     const pecaIndice = pecas.findIndex((p) => p.id === itemAtual.itemId);
@@ -141,7 +253,7 @@ router.put('/itensOS/:id', (req, res) => {
       return res.status(404).json({ sucesso: false, erros: ['Peça não encontrada.'] });
     }
 
-    const diferenca = Number(quantidade) - itemAtual.quantidade; // positivo = precisa retirar mais do estoque
+    const diferenca = Number(quantidade) - itemAtual.quantidade;
     if (diferenca > 0 && diferenca > pecas[pecaIndice].estoqueAtual) {
       return res.status(400).json({
         sucesso: false,
@@ -172,7 +284,6 @@ router.put('/itensOS/:id', (req, res) => {
 });
 
 // DELETE /api/itensOS/:id
-// Remove o item da OS. Se for uma peça, devolve a quantidade ao estoqueAtual.
 router.delete('/itensOS/:id', (req, res) => {
   const itens = carregarItensOS();
   const indice = itens.findIndex((i) => i.id === req.params.id);
