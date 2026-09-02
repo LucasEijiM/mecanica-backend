@@ -1,0 +1,12 @@
+[
+  {
+    "id": "afe6c2b7-610e-4c68-a527-762c6d0612e8",
+    "ordemServicoId": "os-001",
+    "clienteId": "771aeff5-7fb2-4f2d-bf84-51da7936fb8e",
+    "valor": 250.5,
+    "formaPagamento": "cartaoCredito",
+    "status": "pago",
+    "dataPagamento": "2026-09-02T13:31:37.314Z",
+    "parcelas": 3
+  }
+]

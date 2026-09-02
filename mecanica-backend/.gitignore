@@ -1,0 +1,8 @@
+node_modules/
+banco.json
+mecanicos.json
+clientes.json
+veiculos.json
+pecas.json
+itensOS.json
+agendamentos.json
