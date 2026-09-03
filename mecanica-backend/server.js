@@ -1,4 +1,5 @@
 const express = require('express');
+const cors = require('cors');
 const cadastroRoutes = require('./routes/cadastro');
 const veiculosRoutes = require('./routes/veiculos');
 const pecasRoutes = require('./routes/pecas');
@@ -9,8 +10,17 @@ const agendamentosRoutes = require('./routes/agendamentos');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// 🔥 CORS PRIMEIRO, antes de qualquer rota
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+// Depois o parser JSON
 app.use(express.json());
 
+// Rotas
 app.use('/api', cadastroRoutes);
 app.use('/api', veiculosRoutes);
 app.use('/api', pecasRoutes);
