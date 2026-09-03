@@ -1,6 +1,15 @@
 const express = require('express');
 const crypto = require('crypto');
-const { carregarAgendamentos, salvarAgendamentos, carregarUsuarios, carregarVeiculos } = require('../db');
+const { 
+  carregarAgendamentos, 
+  salvarAgendamentos, 
+  carregarUsuarios, 
+  carregarVeiculos 
+} = require('../db');
+
+// 🔥 FIREBASE
+const { db, admin } = require('../firebase-db');
+
 const {
   validarAgendamento,
   validarAtualizacaoAgendamento,
@@ -9,7 +18,6 @@ const {
 const router = express.Router();
 
 // GET /api/agendamentos
-// Lista agendamentos. Aceita ?clienteId=..., ?mecanicoId=..., ?data=AAAA-MM-DD e/ou ?status=...
 router.get('/agendamentos', (req, res) => {
   const { clienteId, mecanicoId, data, status } = req.query;
   let agendamentos = carregarAgendamentos();
@@ -41,12 +49,10 @@ router.get('/agendamentos/:id', (req, res) => {
   return res.json({ sucesso: true, agendamento });
 });
 
-// POST /api/agendamentos
-// Body esperado: { clienteId, mecanicoId, veiculoId, data, hora, servicos, status?, observacoes? }
+// POST /api/agendamentos (JSON DB)
 router.post('/agendamentos', (req, res) => {
   const { clienteId, mecanicoId, veiculoId, data, hora, servicos, status, observacoes } = req.body;
 
-  // 1. Validar campos
   const erros = validarAgendamento({ clienteId, mecanicoId, veiculoId, data, hora, servicos, status, observacoes });
   if (erros.length > 0) {
     return res.status(400).json({ sucesso: false, erros });
@@ -54,7 +60,6 @@ router.post('/agendamentos', (req, res) => {
 
   const usuarios = carregarUsuarios();
 
-  // 2. Verificar se o cliente existe e é do tipo "cliente"
   const cliente = usuarios.find((u) => u.uid === clienteId);
   if (!cliente || cliente.tipo !== 'cliente') {
     return res.status(404).json({ sucesso: false, erros: ['Cliente não encontrado.'] });
@@ -63,7 +68,6 @@ router.post('/agendamentos', (req, res) => {
     return res.status(409).json({ sucesso: false, erros: ['Cliente está inativo.'] });
   }
 
-  // 3. Verificar se o mecânico existe e é do tipo "mecanico"
   const mecanico = usuarios.find((u) => u.uid === mecanicoId);
   if (!mecanico || mecanico.tipo !== 'mecanico') {
     return res.status(404).json({ sucesso: false, erros: ['Mecânico não encontrado.'] });
@@ -72,7 +76,6 @@ router.post('/agendamentos', (req, res) => {
     return res.status(409).json({ sucesso: false, erros: ['Mecânico está inativo.'] });
   }
 
-  // 4. Verificar se o veículo existe e pertence ao cliente informado
   const veiculo = carregarVeiculos().find((v) => v.id === veiculoId);
   if (!veiculo) {
     return res.status(404).json({ sucesso: false, erros: ['Veículo não encontrado.'] });
@@ -81,7 +84,6 @@ router.post('/agendamentos', (req, res) => {
     return res.status(400).json({ sucesso: false, erros: ['O veículo informado não pertence a esse cliente.'] });
   }
 
-  // 5. Verificar conflito de horário para o mesmo mecânico (ignora agendamentos cancelados)
   const agendamentos = carregarAgendamentos();
   const conflito = agendamentos.some(
     (a) => a.mecanicoId === mecanicoId && a.data === data && a.hora === hora && a.status !== 'cancelado'
@@ -93,7 +95,6 @@ router.post('/agendamentos', (req, res) => {
     });
   }
 
-  // 6. Montar o documento agendamentos/{id}
   const novoAgendamento = {
     id: crypto.randomUUID(),
     clienteId,
@@ -116,9 +117,136 @@ router.post('/agendamentos', (req, res) => {
   });
 });
 
+// 🔥 NOVA ROTA - SALVA NO FIREBASE
+router.post('/agendamentos-firebase', async (req, res) => {
+  const { clienteId, mecanicoId, veiculoId, data, hora, servicos, status, observacoes } = req.body;
+
+  const erros = validarAgendamento({ clienteId, mecanicoId, veiculoId, data, hora, servicos, status, observacoes });
+  if (erros.length > 0) {
+    return res.status(400).json({ sucesso: false, erros });
+  }
+
+  const usuarios = carregarUsuarios();
+
+  const cliente = usuarios.find((u) => u.uid === clienteId);
+  if (!cliente || cliente.tipo !== 'cliente') {
+    return res.status(404).json({ sucesso: false, erros: ['Cliente não encontrado.'] });
+  }
+  if (!cliente.ativo) {
+    return res.status(409).json({ sucesso: false, erros: ['Cliente está inativo.'] });
+  }
+
+  const mecanico = usuarios.find((u) => u.uid === mecanicoId);
+  if (!mecanico || mecanico.tipo !== 'mecanico') {
+    return res.status(404).json({ sucesso: false, erros: ['Mecânico não encontrado.'] });
+  }
+  if (!mecanico.ativo) {
+    return res.status(409).json({ sucesso: false, erros: ['Mecânico está inativo.'] });
+  }
+
+  const veiculo = carregarVeiculos().find((v) => v.id === veiculoId);
+  if (!veiculo) {
+    return res.status(404).json({ sucesso: false, erros: ['Veículo não encontrado.'] });
+  }
+  if (veiculo.clienteId !== clienteId) {
+    return res.status(400).json({ sucesso: false, erros: ['O veículo informado não pertence a esse cliente.'] });
+  }
+
+  const agendamentos = carregarAgendamentos();
+  const conflito = agendamentos.some(
+    (a) => a.mecanicoId === mecanicoId && a.data === data && a.hora === hora && a.status !== 'cancelado'
+  );
+  if (conflito) {
+    return res.status(409).json({
+      sucesso: false,
+      erros: ['O mecânico já possui um agendamento nesse dia e horário.'],
+    });
+  }
+
+  try {
+    const firebaseData = {
+      clienteId,
+      mecanicoId,
+      veiculoId,
+      data,
+      hora,
+      servicos: servicos.map((s) => s.trim()),
+      status: status || 'agendado',
+      observacoes: observacoes ? observacoes.trim() : '',
+      criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const docRef = await db.collection('agendamentos').add(firebaseData);
+    const firebaseId = docRef.id;
+
+    const novoAgendamento = {
+      id: firebaseId,
+      clienteId,
+      mecanicoId,
+      veiculoId,
+      data,
+      hora,
+      servicos: servicos.map((s) => s.trim()),
+      status: status || 'agendado',
+      observacoes: observacoes ? observacoes.trim() : '',
+      firebaseId,
+    };
+
+    agendamentos.push(novoAgendamento);
+    salvarAgendamentos(agendamentos);
+
+    return res.status(201).json({
+      sucesso: true,
+      mensagem: 'Agendamento salvo no Firebase e no JSON!',
+      firebaseId,
+      agendamento: novoAgendamento,
+    });
+
+  } catch (error) {
+    console.error('Erro ao salvar agendamento no Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao salvar no Firebase: ' + error.message]
+    });
+  }
+});
+
+// 🔥 NOVA ROTA - LISTAR AGENDAMENTOS DO FIREBASE
+router.get('/agendamentos-firebase', async (req, res) => {
+  try {
+    const { clienteId, mecanicoId, data, status } = req.query;
+    let query = db.collection('agendamentos');
+
+    if (clienteId) {
+      query = query.where('clienteId', '==', clienteId);
+    }
+    if (mecanicoId) {
+      query = query.where('mecanicoId', '==', mecanicoId);
+    }
+    if (data) {
+      query = query.where('data', '==', data);
+    }
+    if (status) {
+      query = query.where('status', '==', status);
+    }
+
+    const snapshot = await query.get();
+    const agendamentos = [];
+    snapshot.forEach(doc => {
+      agendamentos.push({ id: doc.id, ...doc.data() });
+    });
+
+    return res.json({ sucesso: true, agendamentos });
+  } catch (error) {
+    console.error('Erro ao listar agendamentos do Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao listar agendamentos do Firebase: ' + error.message]
+    });
+  }
+});
+
 // PUT /api/agendamentos/:id
-// Atualiza um agendamento (todos os campos são opcionais, exceto clienteId, que não muda)
-// Body esperado: { mecanicoId?, veiculoId?, data?, hora?, servicos?, status?, observacoes? }
 router.put('/agendamentos/:id', (req, res) => {
   const { mecanicoId, veiculoId, data, hora, servicos, status, observacoes } = req.body;
 
@@ -136,7 +264,6 @@ router.put('/agendamentos/:id', (req, res) => {
 
   const atual = agendamentos[indice];
 
-  // Se o mecânico for alterado, verifica se existe e está ativo
   if (mecanicoId !== undefined) {
     const mecanico = carregarUsuarios().find((u) => u.uid === mecanicoId);
     if (!mecanico || mecanico.tipo !== 'mecanico') {
@@ -147,7 +274,6 @@ router.put('/agendamentos/:id', (req, res) => {
     }
   }
 
-  // Se o veículo for alterado, verifica se existe e pertence ao cliente do agendamento
   if (veiculoId !== undefined) {
     const veiculo = carregarVeiculos().find((v) => v.id === veiculoId);
     if (!veiculo) {
@@ -158,7 +284,6 @@ router.put('/agendamentos/:id', (req, res) => {
     }
   }
 
-  // Verifica conflito de horário se mecânico, data ou hora forem alterados
   const mecanicoFinal = mecanicoId !== undefined ? mecanicoId : atual.mecanicoId;
   const dataFinal = data !== undefined ? data : atual.data;
   const horaFinal = hora !== undefined ? hora : atual.hora;
@@ -201,7 +326,6 @@ router.put('/agendamentos/:id', (req, res) => {
   });
 });
 
-// Altera apenas o status de um agendamento (ex: confirmar, iniciar, concluir, cancelar)
 function alterarStatusAgendamento(req, res, novoStatus) {
   const agendamentos = carregarAgendamentos();
   const indice = agendamentos.findIndex((a) => a.id === req.params.id);
@@ -220,19 +344,11 @@ function alterarStatusAgendamento(req, res, novoStatus) {
   });
 }
 
-// PATCH /api/agendamentos/:id/confirmar
 router.patch('/agendamentos/:id/confirmar', (req, res) => alterarStatusAgendamento(req, res, 'confirmado'));
-
-// PATCH /api/agendamentos/:id/iniciar
 router.patch('/agendamentos/:id/iniciar', (req, res) => alterarStatusAgendamento(req, res, 'emAndamento'));
-
-// PATCH /api/agendamentos/:id/concluir
 router.patch('/agendamentos/:id/concluir', (req, res) => alterarStatusAgendamento(req, res, 'concluido'));
-
-// PATCH /api/agendamentos/:id/cancelar
 router.patch('/agendamentos/:id/cancelar', (req, res) => alterarStatusAgendamento(req, res, 'cancelado'));
 
-// DELETE /api/agendamentos/:id
 router.delete('/agendamentos/:id', (req, res) => {
   const agendamentos = carregarAgendamentos();
   const indice = agendamentos.findIndex((a) => a.id === req.params.id);

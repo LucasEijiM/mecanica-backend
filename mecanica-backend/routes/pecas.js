@@ -1,6 +1,10 @@
 const express = require('express');
 const crypto = require('crypto');
 const { carregarPecas, salvarPecas } = require('../db');
+
+// 🔥 FIREBASE
+const { db, admin } = require('../firebase-db');
+
 const {
   validarPeca,
   validarAtualizacaoPeca,
@@ -10,8 +14,6 @@ const {
 const router = express.Router();
 
 // GET /api/pecas
-// Lista peças. Aceita ?busca=texto (código/nome/marca), ?ativo=true|false
-// e ?abaixoMinimo=true (só peças com estoqueAtual <= estoqueMinimo)
 router.get('/pecas', (req, res) => {
   const { busca, ativo, abaixoMinimo } = req.query;
   let pecas = carregarPecas();
@@ -46,8 +48,7 @@ router.get('/pecas/:id', (req, res) => {
   return res.json({ sucesso: true, peca });
 });
 
-// POST /api/pecas
-// Body esperado: { codigo, nome, marca, precoCusto, precoVenda, estoqueAtual?, estoqueMinimo? }
+// POST /api/pecas (JSON DB)
 router.post('/pecas', (req, res) => {
   const { codigo, nome, marca, precoCusto, precoVenda, estoqueAtual, estoqueMinimo } = req.body;
 
@@ -58,7 +59,6 @@ router.post('/pecas', (req, res) => {
 
   const pecas = carregarPecas();
 
-  // Evita cadastrar duas peças com o mesmo código
   const codigoLimpo = codigo.trim().toUpperCase();
   const codigoExiste = pecas.some((p) => p.codigo === codigoLimpo);
   if (codigoExiste) {
@@ -90,9 +90,113 @@ router.post('/pecas', (req, res) => {
   });
 });
 
+// 🔥 NOVA ROTA - SALVA NO FIREBASE
+router.post('/pecas-firebase', async (req, res) => {
+  const { codigo, nome, marca, precoCusto, precoVenda, estoqueAtual, estoqueMinimo } = req.body;
+
+  const erros = validarPeca({ codigo, nome, marca, precoCusto, precoVenda, estoqueAtual, estoqueMinimo });
+  if (erros.length > 0) {
+    return res.status(400).json({ sucesso: false, erros });
+  }
+
+  const pecas = carregarPecas();
+
+  const codigoLimpo = codigo.trim().toUpperCase();
+  const codigoExiste = pecas.some((p) => p.codigo === codigoLimpo);
+  if (codigoExiste) {
+    return res.status(409).json({
+      sucesso: false,
+      erros: ['Já existe uma peça cadastrada com esse código.'],
+    });
+  }
+
+  try {
+    const firebaseData = {
+      codigo: codigoLimpo,
+      nome: nome.trim(),
+      marca: marca.trim(),
+      precoCusto: Number(precoCusto),
+      precoVenda: Number(precoVenda),
+      estoqueAtual: estoqueAtual !== undefined ? Number(estoqueAtual) : 0,
+      estoqueMinimo: estoqueMinimo !== undefined ? Number(estoqueMinimo) : 0,
+      ativo: true,
+      criadoEm: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    const docRef = await db.collection('pecas').add(firebaseData);
+    const firebaseId = docRef.id;
+
+    const novaPeca = {
+      id: firebaseId,
+      codigo: codigoLimpo,
+      nome: nome.trim(),
+      marca: marca.trim(),
+      precoCusto: Number(precoCusto),
+      precoVenda: Number(precoVenda),
+      estoqueAtual: estoqueAtual !== undefined ? Number(estoqueAtual) : 0,
+      estoqueMinimo: estoqueMinimo !== undefined ? Number(estoqueMinimo) : 0,
+      ativo: true,
+      firebaseId,
+    };
+
+    pecas.push(novaPeca);
+    salvarPecas(pecas);
+
+    return res.status(201).json({
+      sucesso: true,
+      mensagem: 'Peça salva no Firebase e no JSON!',
+      firebaseId,
+      peca: novaPeca,
+    });
+
+  } catch (error) {
+    console.error('Erro ao salvar peça no Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao salvar no Firebase: ' + error.message]
+    });
+  }
+});
+
+// 🔥 NOVA ROTA - LISTAR PEÇAS DO FIREBASE
+router.get('/pecas-firebase', async (req, res) => {
+  try {
+    const { busca, ativo, abaixoMinimo } = req.query;
+    let query = db.collection('pecas');
+
+    const snapshot = await query.get();
+    let pecas = [];
+    snapshot.forEach(doc => {
+      pecas.push({ id: doc.id, ...doc.data() });
+    });
+
+    if (busca) {
+      const termo = busca.toLowerCase();
+      pecas = pecas.filter(
+        (p) =>
+          p.codigo?.toLowerCase().includes(termo) ||
+          p.nome?.toLowerCase().includes(termo) ||
+          p.marca?.toLowerCase().includes(termo)
+      );
+    }
+    if (ativo !== undefined) {
+      pecas = pecas.filter((p) => p.ativo === (ativo === 'true'));
+    }
+    if (abaixoMinimo === 'true') {
+      pecas = pecas.filter((p) => p.estoqueAtual <= p.estoqueMinimo);
+    }
+
+    return res.json({ sucesso: true, pecas });
+  } catch (error) {
+    console.error('Erro ao listar peças do Firebase:', error);
+    return res.status(500).json({
+      sucesso: false,
+      erros: ['Erro ao listar peças do Firebase: ' + error.message]
+    });
+  }
+});
+
 // PUT /api/pecas/:id
-// Atualiza dados da peça (todos os campos são opcionais)
-// Body esperado: { codigo?, nome?, marca?, precoCusto?, precoVenda?, estoqueAtual?, estoqueMinimo? }
 router.put('/pecas/:id', (req, res) => {
   const { codigo, nome, marca, precoCusto, precoVenda, estoqueAtual, estoqueMinimo } = req.body;
 
@@ -108,7 +212,6 @@ router.put('/pecas/:id', (req, res) => {
     return res.status(404).json({ sucesso: false, erros: ['Peça não encontrada.'] });
   }
 
-  // Se o código for alterado, verifica se já não existe outra peça com esse código
   let codigoLimpo;
   if (codigo !== undefined) {
     codigoLimpo = codigo.trim().toUpperCase();
@@ -143,7 +246,6 @@ router.put('/pecas/:id', (req, res) => {
   });
 });
 
-// Ativa/desativa uma peça (soft delete)
 function alterarStatusPeca(req, res, ativo) {
   const pecas = carregarPecas();
   const indice = pecas.findIndex((p) => p.id === req.params.id);
@@ -162,13 +264,9 @@ function alterarStatusPeca(req, res, ativo) {
   });
 }
 
-// PATCH /api/pecas/:id/desativar
 router.patch('/pecas/:id/desativar', (req, res) => alterarStatusPeca(req, res, false));
-
-// PATCH /api/pecas/:id/ativar
 router.patch('/pecas/:id/ativar', (req, res) => alterarStatusPeca(req, res, true));
 
-// DELETE /api/pecas/:id (remoção definitiva)
 router.delete('/pecas/:id', (req, res) => {
   const pecas = carregarPecas();
   const indice = pecas.findIndex((p) => p.id === req.params.id);
@@ -187,9 +285,6 @@ router.delete('/pecas/:id', (req, res) => {
   });
 });
 
-// PATCH /api/pecas/:id/adicionar
-// Body esperado: { quantidade }
-// Soma a quantidade enviada ao estoqueAtual da peça (entrada de estoque)
 router.patch('/pecas/:id/adicionar', (req, res) => {
   const { quantidade } = req.body;
 
@@ -215,9 +310,6 @@ router.patch('/pecas/:id/adicionar', (req, res) => {
   });
 });
 
-// PATCH /api/pecas/:id/retirar
-// Body esperado: { quantidade }
-// Subtrai a quantidade enviada do estoqueAtual da peça (saída de estoque)
 router.patch('/pecas/:id/retirar', (req, res) => {
   const { quantidade } = req.body;
 

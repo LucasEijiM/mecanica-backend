@@ -8,5 +8,16 @@
     "status": "pago",
     "dataPagamento": "2026-09-02T13:31:37.314Z",
     "parcelas": 3
+  },
+  {
+    "id": "fXgUuXTNOpC0tPITFAHn",
+    "ordemServicoId": "OS-2026-002",
+    "clienteId": "VT809AU8zeqK9cUoZs6O",
+    "valor": 145,
+    "formaPagamento": "pix",
+    "status": "pendente",
+    "dataPagamento": null,
+    "parcelas": 1,
+    "firebaseId": "fXgUuXTNOpC0tPITFAHn"
   }
 ]
