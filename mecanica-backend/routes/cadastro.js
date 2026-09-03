@@ -157,6 +157,7 @@ router.post('/cadastro-firebase', async (req, res) => {
   }
 
   try {
+    // 1. SALVAR NO FIRESTORE - USUARIOS
     const firebaseData = {
       nome: nome.trim(),
       email: email.toLowerCase().trim(),
@@ -171,6 +172,23 @@ router.post('/cadastro-firebase', async (req, res) => {
     const docRef = await db.collection('usuarios').add(firebaseData);
     const firebaseId = docRef.id;
 
+    // 🔥 2. SALVAR NO FIRESTORE - CLIENTES OU MECANICOS
+    if (tipo === 'mecanico') {
+      await db.collection('mecanicos').doc(firebaseId).set({
+        especialidade: req.body.especialidade || '',
+        comissao: req.body.comissao || 0,
+        dataContratacao: admin.firestore.FieldValue.serverTimestamp(),
+        ativo: true
+      });
+    } else {
+      await db.collection('clientes').doc(firebaseId).set({
+        endereco: req.body.endereco || '',
+        complemento: req.body.complemento || '',
+        ativo: true
+      });
+    }
+
+    // 3. SALVAR NO JSON DB
     const senhaHash = await bcrypt.hash(senha, 10);
     const novoUsuario = {
       uid: firebaseId,
@@ -218,7 +236,7 @@ router.post('/cadastro-firebase', async (req, res) => {
     const { senha: _senha, ...usuarioSemSenha } = novoUsuario;
     return res.status(201).json({
       sucesso: true,
-      mensagem: 'Cliente salvo no Firebase e no JSON!',
+      mensagem: 'Usuário salvo no Firebase e no JSON!',
       firebaseId,
       usuario: { ...usuarioSemSenha, ...dadosExtra },
     });
